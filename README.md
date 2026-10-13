@@ -1,3 +1,4 @@
+# Version 1.2
 # Technology Lifecycle & EOS Command Center
 
 A professional, executive-style web app for tracking End-of-Support (EOS)
