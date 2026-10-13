@@ -1,8 +1,10 @@
+import { useEscapeKey } from "../hooks.js";
 import { useState } from "react";
 
 const EMPTY = { component_type: "Application", tech_name: "", version: "", eoss_date: "", eoes_date: "", notes: "" };
 
 export default function CatalogEntryModal({ entry, onClose, onSubmit }) {
+  useEscapeKey(onClose);
   const isEdit = Boolean(entry);
   const [form, setForm] = useState(entry ? { ...EMPTY, ...entry } : EMPTY);
   const [error, setError] = useState("");
