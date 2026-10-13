@@ -1,3 +1,4 @@
+import { useEscapeKey } from "../hooks.js";
 import { useState } from "react";
 
 const EMPTY_APP = {
@@ -32,6 +33,7 @@ function toFormComponents(components, catalog) {
 }
 
 export default function AppFormModal({ app, catalog, onClose, onSubmit, onDelete }) {
+  useEscapeKey(onClose);
   const isEdit = Boolean(app);
   const [form, setForm] = useState(app ? { ...EMPTY_APP, ...app } : EMPTY_APP);
   const [components, setComponents] = useState(toFormComponents(app?.components, catalog));

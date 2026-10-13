@@ -1,242 +1,269 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { allComponents, byType } from "./aggregations.js";
+import { allComponents, isAtRisk } from "./aggregations.js";
 import { api } from "./api.js";
 import AppFormModal from "./components/AppFormModal.jsx";
 import CatalogEntryModal from "./components/CatalogEntryModal.jsx";
-import ComponentTypeTab from "./components/ComponentTypeTab.jsx";
-import ExecutiveDashboardTab from "./components/ExecutiveDashboardTab.jsx";
-import Header from "./components/Header.jsx";
+import CatalogTab from "./components/CatalogTab.jsx";
+import DashboardTab from "./components/DashboardTab.jsx";
+import { AppDrawerContent, Drawer, StatusDrawerContent } from "./components/Drawer.jsx";
+import Icon from "./components/Icon.jsx";
+import LayerTab from "./components/LayerTab.jsx";
 import LoginModal from "./components/LoginModal.jsx";
-import OwnerRemediationTab from "./components/OwnerRemediationTab.jsx";
-import TabNav from "./components/TabNav.jsx";
-import TechCatalogTab from "./components/TechCatalogTab.jsx";
+import RemediationTab from "./components/RemediationTab.jsx";
+import TopBar, { AdminBar } from "./components/TopBar.jsx";
 import UpgradePlanModal from "./components/UpgradePlanModal.jsx";
+import { SkeletonDashboard, Toasts } from "./components/ui.jsx";
+import { STATUS, TABS } from "./constants.js";
+import { downloadCsv } from "./lib/csv.js";
+import { fmtDate, startOfDay, toISO } from "./lib/dates.js";
 
 const TOKEN_KEY = "eos_admin_token";
+
+const CSV_COLUMNS = [
+  { label: "App ID", value: (c) => c.app_id },
+  { label: "Application", value: (c) => c.app_name },
+  { label: "Platform", value: (c) => c.platform },
+  { label: "Layer", value: (c) => c.component_type },
+  { label: "Technology", value: (c) => c.tech_name },
+  { label: "Version", value: (c) => c.version },
+  { label: "Standard support ends (EOSS)", value: (c) => c.eol_date },
+  { label: "Extended support ends (EOES)", value: (c) => c.extended_support_date },
+  { label: "Effective support end", value: (c) => (c.supportEnd ? toISO(c.supportEnd) : "") },
+  { label: "Status", value: (c) => STATUS[c.status]?.label },
+  { label: "Application owner", value: (c) => c.app_owner },
+  { label: "Application owner email", value: (c) => c.app_owner_email },
+  { label: "Platform owner", value: (c) => c.platform_owner },
+  { label: "Upgrade plan", value: (c) => c.upgrade_plan },
+  { label: "Plan target date", value: (c) => c.upgrade_target_date },
+];
+
+const tabFromHash = () => {
+  const h = window.location.hash.replace(/^#\/?/, "");
+  return TABS.find((t) => t.hash === h)?.id || "dashboard";
+};
+const isAuthError = (err) => /admin token/i.test(err?.message || "");
 
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [apps, setApps] = useState([]);
   const [catalog, setCatalog] = useState([]);
+  const [today, setToday] = useState(() => startOfDay());
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [activeTab, setActiveTab] = useState("executive");
-
+  const [view, setView] = useState(() => ({ tab: tabFromHash(), preset: null, nonce: 0 }));
+  const [drawer, setDrawer] = useState([]);                 // stack of { type: "app"|"status", ... }
   const [showLogin, setShowLogin] = useState(false);
-  const [editingApp, setEditingApp] = useState(null);     // object = edit, "NEW" = create
-  const [planTarget, setPlanTarget] = useState(null);      // { app, component }
-  const [editingCatalogEntry, setEditingCatalogEntry] = useState(null); // object = edit, "NEW" = create
+  const [editingApp, setEditingApp] = useState(null);       // app object = edit, "NEW" = create
+  const [planTarget, setPlanTarget] = useState(null);       // { app, component }
+  const [editingEntry, setEditingEntry] = useState(null);   // catalog entry = edit, "NEW" = create
   const [importBusy, setImportBusy] = useState(false);
-  const [importMsg, setImportMsg] = useState("");
+  const [toasts, setToasts] = useState([]);
+  const loadedOnce = useRef(false);
 
   const isAdmin = Boolean(token);
+  const modalOpen = showLogin || Boolean(editingApp) || Boolean(planTarget) || Boolean(editingEntry);
 
-  const refresh = async () => {
-    setLoading(true);
+  const notify = useCallback((message, tone = "ok") => {
+    const id = Date.now() + Math.random();
+    setToasts((t) => [...t, { id, message, tone }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4500);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    if (!loadedOnce.current) setLoading(true);   // only show the skeleton on first load
     setLoadError("");
     try {
-      const [appsData, catalogData] = await Promise.all([api.listApps(), api.listCatalog()]);
-      setApps(appsData);
-      setCatalog(catalogData);
+      const [a, c] = await Promise.all([api.listApps(), api.listCatalog()]);
+      setApps(a);
+      setCatalog(c);
+      setToday(startOfDay());
+      loadedOnce.current = true;
     } catch (err) {
       setLoadError(err.message || "Could not load data");
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    refresh();
   }, []);
 
-  const tabCounts = useMemo(() => {
-    const components = allComponents(apps);
-    const types = byType(components);
-    const outstanding = apps.reduce(
-      (n, a) => n + a.components.filter((c) => c.status === "RED" || c.status === "AMBER").length,
-      0
-    );
-    return {
-      Application: types.Application?.total ?? 0,
-      Database: types.Database?.total ?? 0,
-      OS: types.OS?.total ?? 0,
-      remediation: outstanding,
-    };
-  }, [apps]);
+  useEffect(() => { refresh(); }, [refresh]);
 
+  // Navigation: tab + optional preset filters, mirrored into the URL hash so views are linkable.
+  const go = useCallback((tab, preset = null) => {
+    setView({ tab, preset, nonce: Date.now() });
+    setDrawer([]);
+    const hash = `#/${TABS.find((t) => t.id === tab).hash}`;
+    if (window.location.hash !== hash) window.location.hash = hash;
+    window.scrollTo({ top: 0 });
+  }, []);
+
+  useEffect(() => {
+    const onHash = () => {
+      const t = tabFromHash();
+      setView((v) => (v.tab === t ? v : { tab: t, preset: null, nonce: Date.now() }));
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const components = useMemo(() => allComponents(apps), [apps]);
+  const missingPlans = useMemo(() => components.filter((c) => isAtRisk(c) && !c.upgrade_plan).length, [components]);
+
+  // ---- auth ----
   const handleLogin = async (password) => {
     const res = await api.login(password);
     setToken(res.token);
     localStorage.setItem(TOKEN_KEY, res.token);
     setShowLogin(false);
+    notify("Signed in. Admin mode is on.");
   };
-
-  const handleLogout = () => {
+  const handleLogout = useCallback((silent) => {
     setToken("");
     localStorage.removeItem(TOKEN_KEY);
-  };
-
-  const handleSaveApp = async (payload, existingId) => {
-    if (existingId) {
-      await api.updateApp(token, existingId, payload);
-    } else {
-      await api.createApp(token, payload);
+    if (silent !== true) notify("Signed out.");
+  }, [notify]);
+  // Wrap admin calls: if the session expired, drop back to User Mode with a clear message.
+  const authed = async (fn) => {
+    try { return await fn(); } catch (err) {
+      if (isAuthError(err)) { handleLogout(true); notify("Your admin session expired. Please sign in again.", "error"); }
+      throw err;
     }
-    await refresh();
   };
 
+  // ---- drawer ----
+  const openApp = useCallback((pk) => setDrawer((d) => (d.length && d[d.length - 1].type === "status" ? [...d, { type: "app", appPk: pk }] : [{ type: "app", appPk: pk }])), []);
+  const openStatus = useCallback((status) => setDrawer([{ type: "status", status }]), []);
+  const closeDrawer = useCallback(() => setDrawer([]), []);
+  const popDrawer = useCallback(() => setDrawer((d) => d.slice(0, -1)), []);
+  const top = drawer[drawer.length - 1];
+
+  // ---- data mutations ----
+  const handleSaveApp = async (payload, existingId) => {
+    await authed(() => (existingId ? api.updateApp(token, existingId, payload) : api.createApp(token, payload)));
+    await refresh();
+    notify(existingId ? `${payload.app_name} updated.` : `${payload.app_name} onboarded.`);
+  };
   const handleDelete = async (app) => {
-    if (!confirm(`Delete ${app.app_id} - ${app.app_name}? This removes all its components too.`)) return;
-    await api.deleteApp(token, app.id);
-    await refresh();
+    if (!window.confirm(`Delete ${app.app_id} \u2013 ${app.app_name}? This also removes its ${app.components.length} component(s).`)) return false;
+    try {
+      await authed(() => api.deleteApp(token, app.id));
+      await refresh();
+      setDrawer([]);
+      notify(`${app.app_name} deleted.`);
+      return true;
+    } catch (err) { notify(err.message || "Could not delete application.", "error"); return false; }
   };
-
   const handleUpdatePlan = async (componentId, body) => {
-    await api.updateUpgradePlan(token, componentId, body);
+    await authed(() => api.updateUpgradePlan(token, componentId, body));
     await refresh();
+    notify("Upgrade plan saved.");
   };
-
   const handleImport = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setImportBusy(true);
-    setImportMsg("");
     try {
-      const result = await api.importExcel(token, file);
-      setImportMsg(
-        `Imported: ${result.apps_created} app(s) created, ${result.apps_updated} updated` +
-          (result.errors.length ? `, ${result.errors.length} row error(s)` : "")
-      );
+      const r = await authed(() => api.importExcel(token, file));
       await refresh();
+      notify(`Import complete: ${r.apps_created} created, ${r.apps_updated} updated${r.errors.length ? `, ${r.errors.length} row error(s)` : ""}.`, r.errors.length ? "error" : "ok");
     } catch (err) {
-      setImportMsg(err.message || "Import failed");
+      if (!isAuthError(err)) notify(err.message || "Import failed.", "error");
     } finally {
       setImportBusy(false);
       e.target.value = "";
     }
   };
-
-  const openEditByPk = (appPk) => {
-    const found = apps.find((a) => a.id === appPk);
-    if (found) setEditingApp(found);
-  };
-
-  const handleSaveCatalogEntry = async (payload, existingId) => {
-    if (existingId) {
-      await api.updateCatalogEntry(token, existingId, payload);
-    } else {
-      await api.createCatalogEntry(token, payload);
-    }
+  const handleSaveEntry = async (payload, existingId) => {
+    await authed(() => (existingId ? api.updateCatalogEntry(token, existingId, payload) : api.createCatalogEntry(token, payload)));
     await refresh();
+    notify(`${payload.tech_name} ${payload.version} ${existingId ? "updated" : "added to the catalog"}.`);
+  };
+  const handleDeleteEntry = async (entry) => {
+    if (!window.confirm(`Remove ${entry.tech_name} ${entry.version} from the catalog? Existing applications keep their dates.`)) return;
+    try {
+      await authed(() => api.deleteCatalogEntry(token, entry.id));
+      await refresh();
+      notify(`${entry.tech_name} ${entry.version} removed.`);
+    } catch (err) { notify(err.message || "Could not remove entry.", "error"); }
   };
 
-  const handleDeleteCatalogEntry = async (entry) => {
-    if (!confirm(`Remove ${entry.tech_name} ${entry.version} from the catalog?`)) return;
-    await api.deleteCatalogEntry(token, entry.id);
-    await refresh();
-  };
+  const exportCsv = (rows, name) =>
+    downloadCsv(`eos-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${toISO(today)}.csv`, CSV_COLUMNS, rows);
+
+  const editByPk = (pk) => { const a = apps.find((x) => x.id === pk); if (a) setEditingApp(a); };
+  const planFor = (c) => { const app = apps.find((a) => a.id === c._appPk); if (app) setPlanTarget({ app, component: c }); };
+
+  const common = { apps, isAdmin, today, onOpenApp: openApp };
 
   return (
     <div className="app-shell">
-      <Header isAdmin={isAdmin} onLoginClick={() => setShowLogin(true)} onLogout={handleLogout} />
+      <a className="skip-link" href="#main">Skip to content</a>
+      <TopBar tab={view.tab} onTab={(t) => go(t)} isAdmin={isAdmin} onLogin={() => setShowLogin(true)} onLogout={() => handleLogout()}
+        bellCount={missingPlans} apps={apps} onOpenApp={openApp} onOpenTech={(t) => go(t.type, { q: t.name })} />
+      {isAdmin && <AdminBar importBusy={importBusy} onImport={handleImport} onOnboard={() => setEditingApp("NEW")} />}
 
-      <div className="tab-bar-row">
-        <TabNav active={activeTab} onChange={setActiveTab} counts={tabCounts} />
-        {isAdmin && activeTab !== "catalog" && (
-          <div className="tab-bar-actions">
-            <label className="btn btn-outline btn-sm import-label">
-              {importBusy ? "Importing..." : "Import Excel"}
-              <input
-                type="file"
-                accept=".xlsx,.xls"
-                onChange={handleImport}
-                disabled={importBusy}
-                style={{ display: "none" }}
-              />
-            </label>
-            <button className="btn btn-primary btn-sm" onClick={() => setEditingApp("NEW")}>
-              + Onboard application
-            </button>
+      <main className="page" id="main">
+        {loading && <SkeletonDashboard />}
+        {!loading && loadError && (
+          <div className="card error-card">
+            <span className="empty-icon err"><Icon name="alert-triangle" size={26} /></span>
+            <h3>We couldn&rsquo;t load the data</h3>
+            <p>{loadError}</p>
+            <button type="button" className="btn btn-dark" onClick={refresh}>Try again</button>
           </div>
         )}
-      </div>
-      {importMsg && <div className="hint-text" style={{ padding: "0 32px", marginTop: 8 }}>{importMsg}</div>}
-
-      <main className="main">
-        {loading && <div className="empty-state">Loading...</div>}
-        {loadError && <div className="error-text">{loadError}</div>}
-
         {!loading && !loadError && (
           <>
-            {activeTab === "executive" && (
-              <ExecutiveDashboardTab apps={apps} onOpenType={setActiveTab} />
+            {view.tab === "dashboard" && (
+              <DashboardTab key={view.nonce} {...common} catalog={catalog} go={go} onOpenStatus={openStatus}
+                onExport={() => exportCsv(components, "all-instances")} onOnboard={() => setEditingApp("NEW")} />
             )}
-            {["Application", "Database", "OS"].includes(activeTab) && (
-              <ComponentTypeTab
-                apps={apps}
-                type={activeTab}
-                isAdmin={isAdmin}
-                onEditApp={openEditByPk}
-                onUpdatePlan={(c) => {
-                  const app = apps.find((a) => a.id === c._appPk);
-                  setPlanTarget({ app, component: c });
-                }}
-              />
+            {["Application", "Database", "OS"].includes(view.tab) && (
+              <LayerTab key={`${view.tab}:${view.nonce}`} {...common} type={view.tab} preset={view.preset}
+                onEditApp={editByPk} onPlan={planFor} onExport={exportCsv} />
             )}
-            {activeTab === "remediation" && (
-              <OwnerRemediationTab
-                apps={apps}
-                isAdmin={isAdmin}
-                onUpdatePlan={(app, component) => setPlanTarget({ app, component })}
-              />
+            {view.tab === "remediation" && (
+              <RemediationTab key={view.nonce} {...common} preset={view.preset} onPlan={(app, component) => setPlanTarget({ app, component })} />
             )}
-            {activeTab === "catalog" && (
-              <TechCatalogTab
-                catalog={catalog}
-                isAdmin={isAdmin}
-                onAdd={() => setEditingCatalogEntry("NEW")}
-                onEdit={(entry) => setEditingCatalogEntry(entry)}
-                onDelete={handleDeleteCatalogEntry}
-              />
+            {view.tab === "catalog" && (
+              <CatalogTab catalog={catalog} apps={apps} today={today} isAdmin={isAdmin}
+                onAdd={() => setEditingEntry("NEW")} onEdit={setEditingEntry} onDelete={handleDeleteEntry} />
             )}
           </>
         )}
       </main>
 
       <footer className="app-footer">
-        Application &amp; Database End-of-Support Review &middot; RED and AMBER items require an
-        owner-submitted upgrade plan &middot; Used for quarterly CTO review.
+        EOS Command Center &middot; Data as of {fmtDate(today)} &middot; Red and Amber instances need an owner-submitted upgrade plan &middot; Used for the quarterly CTO review
       </footer>
 
+      {top && (
+        <Drawer onClose={closeDrawer} escapeActive={!modalOpen} label={top.type === "app" ? "Application detail" : "Status detail"}>
+          {top.type === "app" ? (
+            <AppDrawerContent app={apps.find((a) => a.id === top.appPk)} today={today} isAdmin={isAdmin}
+              canBack={drawer.length > 1} onBack={popDrawer} onClose={closeDrawer}
+              onEdit={(app) => setEditingApp(app)} onPlan={(app, component) => setPlanTarget({ app, component })} />
+          ) : (
+            <StatusDrawerContent status={top.status} apps={apps} today={today}
+              canBack={drawer.length > 1} onBack={popDrawer} onClose={closeDrawer} onOpenApp={openApp} />
+          )}
+        </Drawer>
+      )}
+
       {showLogin && <LoginModal onClose={() => setShowLogin(false)} onSubmit={handleLogin} />}
-
       {editingApp && (
-        <AppFormModal
-          app={editingApp === "NEW" ? null : editingApp}
-          catalog={catalog}
-          onClose={() => setEditingApp(null)}
+        <AppFormModal app={editingApp === "NEW" ? null : editingApp} catalog={catalog} onClose={() => setEditingApp(null)}
           onSubmit={handleSaveApp}
-          onDelete={editingApp !== "NEW" ? () => { handleDelete(editingApp); setEditingApp(null); } : undefined}
-        />
+          onDelete={editingApp !== "NEW" ? async () => { if (await handleDelete(editingApp)) setEditingApp(null); } : undefined} />
       )}
-
       {planTarget && (
-        <UpgradePlanModal
-          app={planTarget.app}
-          component={planTarget.component}
-          onClose={() => setPlanTarget(null)}
-          onSubmit={handleUpdatePlan}
-        />
+        <UpgradePlanModal app={planTarget.app} component={planTarget.component} onClose={() => setPlanTarget(null)} onSubmit={handleUpdatePlan} />
+      )}
+      {editingEntry && (
+        <CatalogEntryModal entry={editingEntry === "NEW" ? null : editingEntry} onClose={() => setEditingEntry(null)} onSubmit={handleSaveEntry} />
       )}
 
-      {editingCatalogEntry && (
-        <CatalogEntryModal
-          entry={editingCatalogEntry === "NEW" ? null : editingCatalogEntry}
-          onClose={() => setEditingCatalogEntry(null)}
-          onSubmit={handleSaveCatalogEntry}
-        />
-      )}
+      <Toasts items={toasts} onDismiss={(id) => setToasts((t) => t.filter((x) => x.id !== id))} />
     </div>
   );
 }

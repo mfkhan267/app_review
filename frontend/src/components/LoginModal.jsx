@@ -1,6 +1,8 @@
+import { useEscapeKey } from "../hooks.js";
 import { useState } from "react";
 
 export default function LoginModal({ onClose, onSubmit }) {
+  useEscapeKey(onClose);
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);

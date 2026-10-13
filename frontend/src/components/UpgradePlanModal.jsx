@@ -1,6 +1,9 @@
+import { useEscapeKey } from "../hooks.js";
+import { StatusPill } from "./ui.jsx";
 import { useState } from "react";
 
 export default function UpgradePlanModal({ app, component, onClose, onSubmit }) {
+  useEscapeKey(onClose);
   const [plan, setPlan] = useState(component.upgrade_plan || "");
   const [targetDate, setTargetDate] = useState(component.upgrade_target_date || "");
   const [error, setError] = useState("");
@@ -32,7 +35,7 @@ export default function UpgradePlanModal({ app, component, onClose, onSubmit }) 
             <div className="hint-text" style={{ marginBottom: 14 }}>
               {app.app_id} &middot; {component.component_type}: {component.tech_name}
               {component.version ? ` ${component.version}` : ""} &middot; End of Support{" "}
-              {component.eol_date} &middot; <span className={`badge ${component.status}`}>{component.status}</span>
+              {component.eol_date} &middot; <StatusPill status={component.status} />
             </div>
             <div className="field" style={{ marginBottom: 14 }}>
               <label htmlFor="plan">Upgrade / remediation plan</label>
